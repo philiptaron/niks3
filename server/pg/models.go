@@ -25,6 +25,7 @@ type Object struct {
 	DeletedAt      pgtype.Timestamp `json:"deleted_at"`
 	FirstDeletedAt pgtype.Timestamp `json:"first_deleted_at"`
 	Size           pgtype.Int8      `json:"size"`
+	DeletingAt     pgtype.Timestamp `json:"deleting_at"`
 }
 
 type ObjectStat struct {
@@ -44,6 +45,7 @@ type PendingObject struct {
 	Key              string      `json:"key"`
 	Refs             []string    `json:"refs"`
 	Size             pgtype.Int8 `json:"size"`
+	NeedsUpload      bool        `json:"needs_upload"`
 }
 
 type Pin struct {

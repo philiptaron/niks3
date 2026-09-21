@@ -11,15 +11,61 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const cleanupPendingClosures = `-- name: CleanupPendingClosures :execrows
-WITH cutoff_time AS (
-    SELECT timezone('UTC', now()) - interval '1 second' * $1::int AS time
-),
+const claimObjectsForDeletion = `-- name: ClaimObjectsForDeletion :many
+UPDATE objects SET deleting_at = timezone('UTC', now())
+WHERE key IN (
+    SELECT key
+    FROM objects
+    WHERE deleted_at IS NOT NULL
+      AND (deleting_at IS NULL OR deleting_at < $1::timestamp)
+      AND first_deleted_at <= timezone('UTC', now()) - interval '1 second' * $2::int
+      AND NOT EXISTS (
+          SELECT 1 FROM pending_objects AS po WHERE po.key = objects.key
+      )
+    ORDER BY key
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING key
+`
 
-old_closures AS (
+type ClaimObjectsForDeletionParams struct {
+	RunStartedAt       pgtype.Timestamp `json:"run_started_at"`
+	GracePeriodSeconds int32            `json:"grace_period_seconds"`
+	LimitCount         int32            `json:"limit_count"`
+}
+
+// Claims one batch of tombstoned objects past the grace period for S3
+// deletion by stamping deleting_at. Claimed rows drop out of the next call,
+// so a GC run terminates even when some deletions fail; rows still claimed
+// from a run that died (deleting_at before this run started) are picked up
+// again. Objects referenced by an in-flight closure are left alone, and rows
+// share-locked by a closure being created are skipped for this run.
+func (q *Queries) ClaimObjectsForDeletion(ctx context.Context, arg ClaimObjectsForDeletionParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, claimObjectsForDeletion, arg.RunStartedAt, arg.GracePeriodSeconds, arg.LimitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const cleanupPendingClosures = `-- name: CleanupPendingClosures :execrows
+WITH old_closures AS (
     SELECT id
-    FROM pending_closures, cutoff_time
-    WHERE started_at < cutoff_time.time
+    FROM pending_closures
+    WHERE started_at < $1::timestamp
 ),
 
 inserted_objects AS (
@@ -27,10 +73,10 @@ inserted_objects AS (
     SELECT
         po.key,
         po.refs,
-        cutoff_time.time,
-        cutoff_time.time
+        $1::timestamp,
+        $1::timestamp
     FROM pending_objects AS po
-    JOIN old_closures oc ON po.pending_closure_id = oc.id, cutoff_time
+    JOIN old_closures oc ON po.pending_closure_id = oc.id
     ON CONFLICT (key) DO NOTHING
     RETURNING key
 ),
@@ -47,13 +93,16 @@ USING old_closures
 WHERE pending_closures.id = old_closures.id
 `
 
+// The cutoff is passed in so it matches the one used to select the multipart
+// uploads that were aborted just before; recomputing now() here would let
+// closures that aged past the cutoff in between be deleted without an abort.
 // Insert pending objects into objects table if they don't already exist
 // We mark them as deleted so they can be cleaned up later
 // Delete pending objects that were inserted into the objects table
 // Delete pending closures older than the specified interval
 // This will cascade to pending_objects
-func (q *Queries) CleanupPendingClosures(ctx context.Context, dollar_1 int32) (int64, error) {
-	result, err := q.db.Exec(ctx, cleanupPendingClosures, dollar_1)
+func (q *Queries) CleanupPendingClosures(ctx context.Context, cutoff pgtype.Timestamp) (int64, error) {
+	result, err := q.db.Exec(ctx, cleanupPendingClosures, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -137,30 +186,15 @@ func (q *Queries) GetClosure(ctx context.Context, key string) (pgtype.Timestamp,
 	return updated_at, err
 }
 
-const getClosureForShare = `-- name: GetClosureForShare :one
-SELECT updated_at FROM closures
-WHERE key = $1 LIMIT 1
-FOR SHARE
-`
-
-// Lock the closure row so concurrent GC cannot delete it between the
-// existence check and the pin upsert.
-func (q *Queries) GetClosureForShare(ctx context.Context, key string) (pgtype.Timestamp, error) {
-	row := q.db.QueryRow(ctx, getClosureForShare, key)
-	var updated_at pgtype.Timestamp
-	err := row.Scan(&updated_at)
-	return updated_at, err
-}
-
 const getClosureObjects = `-- name: GetClosureObjects :many
 WITH RECURSIVE closure_reach AS (
     -- Start with the provided closure key
-    SELECT o.key, o.refs 
+    SELECT o.key, o.refs
     FROM objects o
     WHERE o.key = $1
     UNION
     -- Recursively add all referenced objects
-    SELECT o.key, o.refs 
+    SELECT o.key, o.refs
     FROM objects o
     INNER JOIN closure_reach cr ON o.key = ANY(cr.refs)
 )
@@ -189,23 +223,18 @@ func (q *Queries) GetClosureObjects(ctx context.Context, key string) ([]string, 
 }
 
 const getExistingObjects = `-- name: GetExistingObjects :many
-WITH ct AS (
-    SELECT timezone('UTC', now()) AS now
-)
-
 SELECT
-    o.key AS key,
-    (CASE
-        WHEN o.first_deleted_at IS NULL THEN NULL
-        ELSE ct.now - o.first_deleted_at
-    END)::interval AS deleted_at
-FROM objects AS o, ct
+    key,
+    (deleted_at IS NOT NULL)::boolean AS tombstoned,
+    deleting_at
+FROM objects
 WHERE key = any($1::varchar [])
 `
 
 type GetExistingObjectsRow struct {
-	Key       string          `json:"key"`
-	DeletedAt pgtype.Interval `json:"deleted_at"`
+	Key        string           `json:"key"`
+	Tombstoned bool             `json:"tombstoned"`
+	DeletingAt pgtype.Timestamp `json:"deleting_at"`
 }
 
 func (q *Queries) GetExistingObjects(ctx context.Context, dollar_1 []string) ([]GetExistingObjectsRow, error) {
@@ -217,7 +246,7 @@ func (q *Queries) GetExistingObjects(ctx context.Context, dollar_1 []string) ([]
 	var items []GetExistingObjectsRow
 	for rows.Next() {
 		var i GetExistingObjectsRow
-		if err := rows.Scan(&i.Key, &i.DeletedAt); err != nil {
+		if err := rows.Scan(&i.Key, &i.Tombstoned, &i.DeletingAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -262,46 +291,11 @@ func (q *Queries) GetObjectStats(ctx context.Context) (GetObjectStatsRow, error)
 	return i, err
 }
 
-const getObjectsReadyForDeletion = `-- name: GetObjectsReadyForDeletion :many
-SELECT key
-FROM objects
-WHERE first_deleted_at IS NOT NULL
-  AND deleted_at IS NOT NULL
-  AND first_deleted_at <= timezone('UTC', now()) - interval '1 second' * $1::int
-LIMIT $2
-`
-
-type GetObjectsReadyForDeletionParams struct {
-	GracePeriodSeconds int32 `json:"grace_period_seconds"`
-	LimitCount         int32 `json:"limit_count"`
-}
-
-// Returns objects marked for >= grace_period, safe to delete from S3
-func (q *Queries) GetObjectsReadyForDeletion(ctx context.Context, arg GetObjectsReadyForDeletionParams) ([]string, error) {
-	rows, err := q.db.Query(ctx, getObjectsReadyForDeletion, arg.GracePeriodSeconds, arg.LimitCount)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []string
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, err
-		}
-		items = append(items, key)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const getOldMultipartUploads = `-- name: GetOldMultipartUploads :many
 SELECT upload_id, object_key
 FROM multipart_uploads mu
 JOIN pending_closures pc ON mu.pending_closure_id = pc.id
-WHERE pc.started_at < timezone('UTC', now()) - interval '1 second' * $1::int
+WHERE pc.started_at < $1::timestamp
 `
 
 type GetOldMultipartUploadsRow struct {
@@ -309,8 +303,8 @@ type GetOldMultipartUploadsRow struct {
 	ObjectKey string `json:"object_key"`
 }
 
-func (q *Queries) GetOldMultipartUploads(ctx context.Context, dollar_1 int32) ([]GetOldMultipartUploadsRow, error) {
-	rows, err := q.db.Query(ctx, getOldMultipartUploads, dollar_1)
+func (q *Queries) GetOldMultipartUploads(ctx context.Context, cutoff pgtype.Timestamp) ([]GetOldMultipartUploadsRow, error) {
+	rows, err := q.db.Query(ctx, getOldMultipartUploads, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -508,6 +502,7 @@ type InsertPendingObjectsParams struct {
 	Key              string      `json:"key"`
 	Refs             []string    `json:"refs"`
 	Size             pgtype.Int8 `json:"size"`
+	NeedsUpload      bool        `json:"needs_upload"`
 }
 
 const listPins = `-- name: ListPins :many
@@ -542,13 +537,73 @@ func (q *Queries) ListPins(ctx context.Context) ([]Pin, error) {
 	return items, nil
 }
 
+const lockExistingObjects = `-- name: LockExistingObjects :many
+SELECT
+    key,
+    (deleted_at IS NOT NULL)::boolean AS tombstoned,
+    deleting_at
+FROM objects
+WHERE key = any($1::varchar [])
+ORDER BY key
+FOR SHARE
+`
+
+type LockExistingObjectsRow struct {
+	Key        string           `json:"key"`
+	Tombstoned bool             `json:"tombstoned"`
+	DeletingAt pgtype.Timestamp `json:"deleting_at"`
+}
+
+// Share-locks the object rows for the rest of the transaction so the
+// deletion claim (FOR UPDATE SKIP LOCKED) either sees the pending_objects
+// rows this transaction inserts or skips the objects for this run. Rows are
+// locked in key order to keep the lock order consistent across writers.
+func (q *Queries) LockExistingObjects(ctx context.Context, dollar_1 []string) ([]LockExistingObjectsRow, error) {
+	rows, err := q.db.Query(ctx, lockExistingObjects, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LockExistingObjectsRow
+	for rows.Next() {
+		var i LockExistingObjectsRow
+		if err := rows.Scan(&i.Key, &i.Tombstoned, &i.DeletingAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markObjectsAsActive = `-- name: MarkObjectsAsActive :exec
-UPDATE objects SET deleted_at = NULL
+UPDATE objects SET deleted_at = NULL, deleting_at = NULL
 WHERE key = any($1::varchar [])
 `
 
+// Undo a deletion claim whose S3 delete failed. first_deleted_at is kept so
+// the next mark makes the object eligible again without a new grace period.
 func (q *Queries) MarkObjectsAsActive(ctx context.Context, dollar_1 []string) error {
 	_, err := q.db.Exec(ctx, markObjectsAsActive, dollar_1)
+	return err
+}
+
+const markPendingObjectsForUpload = `-- name: MarkPendingObjectsForUpload :exec
+UPDATE pending_objects SET needs_upload = true
+WHERE pending_closure_id = $1 AND key = any($2::varchar [])
+`
+
+type MarkPendingObjectsForUploadParams struct {
+	PendingClosureID int64    `json:"pending_closure_id"`
+	Keys             []string `json:"keys"`
+}
+
+// Flip objects the closure originally treated as present to needs_upload,
+// used when an S3 integrity check finds them missing.
+func (q *Queries) MarkPendingObjectsForUpload(ctx context.Context, arg MarkPendingObjectsForUploadParams) error {
+	_, err := q.db.Exec(ctx, markPendingObjectsForUpload, arg.PendingClosureID, arg.Keys)
 	return err
 }
 
@@ -604,6 +659,19 @@ func (q *Queries) MarkStaleObjects(ctx context.Context) (int64, error) {
 	return result.RowsAffected(), nil
 }
 
+const now = `-- name: Now :one
+SELECT timezone('UTC', now())::timestamp AS now
+`
+
+// The database clock, so timestamps compared against columns stamped with
+// now() in SQL are not skewed by the application host's clock.
+func (q *Queries) Now(ctx context.Context) (pgtype.Timestamp, error) {
+	row := q.db.QueryRow(ctx, now)
+	var now pgtype.Timestamp
+	err := row.Scan(&now)
+	return now, err
+}
+
 const registerCompletedObject = `-- name: RegisterCompletedObject :exec
 INSERT INTO objects (key, refs, size)
 VALUES ($1, $2::varchar [], $3)
@@ -615,7 +683,8 @@ ON CONFLICT (key) DO UPDATE SET
     ),
     size = coalesce(objects.size, excluded.size),
     deleted_at = NULL,
-    first_deleted_at = NULL
+    first_deleted_at = NULL,
+    deleting_at = NULL
 `
 
 type RegisterCompletedObjectParams struct {
@@ -632,14 +701,52 @@ func (q *Queries) RegisterCompletedObject(ctx context.Context, arg RegisterCompl
 	return err
 }
 
-const touchClosures = `-- name: TouchClosures :exec
+const touchClosureForPin = `-- name: TouchClosureForPin :one
 UPDATE closures SET updated_at = timezone('UTC', now())
-WHERE key = any($1::varchar [])
+WHERE key = $1
+RETURNING updated_at
 `
 
-func (q *Queries) TouchClosures(ctx context.Context, dollar_1 []string) error {
-	_, err := q.db.Exec(ctx, touchClosures, dollar_1)
-	return err
+// Refresh and lock the closure row so concurrent GC cannot delete it before
+// the pin upsert commits: DeleteClosures blocks on the row and then
+// re-evaluates updated_at against its cutoff, which now fails.
+func (q *Queries) TouchClosureForPin(ctx context.Context, key string) (pgtype.Timestamp, error) {
+	row := q.db.QueryRow(ctx, touchClosureForPin, key)
+	var updated_at pgtype.Timestamp
+	err := row.Scan(&updated_at)
+	return updated_at, err
+}
+
+const touchPresentClosures = `-- name: TouchPresentClosures :many
+UPDATE closures SET updated_at = timezone('UTC', now())
+FROM objects
+WHERE closures.key = any($1::varchar [])
+  AND objects.key = closures.key
+  AND objects.deleted_at IS NULL
+RETURNING closures.key
+`
+
+// Refresh the closures whose narinfo is live and report which ones were
+// found. Doing the check and the touch in one statement means a closure
+// deleted by concurrent GC is never reported as present.
+func (q *Queries) TouchPresentClosures(ctx context.Context, dollar_1 []string) ([]string, error) {
+	rows, err := q.db.Query(ctx, touchPresentClosures, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertPin = `-- name: UpsertPin :exec

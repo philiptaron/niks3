@@ -47,6 +47,17 @@ func (s *Service) getObjectsForDeletion(ctx context.Context,
 
 	queries := pg.New(s.Pool)
 
+	// Claims are stamped with the database clock, so the run start must come
+	// from it too: a skewed application clock could otherwise make this run's
+	// own claims look stale and be re-fetched forever.
+	runStartedAt, err := queries.Now(ctx)
+	if err != nil {
+		*queryErr = fmt.Errorf("failed to read database clock: %w", err)
+		slog.Error("failed to read database clock", "error", err)
+
+		return
+	}
+
 	// First, mark stale objects and get count
 	marked, err := queries.MarkStaleObjects(ctx)
 	if err != nil {
@@ -62,15 +73,20 @@ func (s *Service) getObjectsForDeletion(ctx context.Context,
 		onProgress(*stats)
 	}
 
-	// Then, get objects ready for deletion (marked > gracePeriod ago)
+	// Then claim objects ready for deletion (marked > gracePeriod ago) one
+	// batch at a time. Each claim stamps deleting_at, so a batch is never
+	// returned twice within this run: the loop ends once every eligible
+	// object has been handed to the consumer, even if some S3 deletes fail
+	// and the rows stay behind until the consumer marks them active again.
 	for {
-		objs, err := queries.GetObjectsReadyForDeletion(ctx, pg.GetObjectsReadyForDeletionParams{
+		objs, err := queries.ClaimObjectsForDeletion(ctx, pg.ClaimObjectsForDeletionParams{
+			RunStartedAt:       runStartedAt,
 			GracePeriodSeconds: gracePeriod,
 			LimitCount:         DeletionBatchSize,
 		})
 		if err != nil {
-			*queryErr = fmt.Errorf("failed to get objects ready for deletion: %w", err)
-			slog.Error("failed to get objects ready for deletion", "error", err)
+			*queryErr = fmt.Errorf("failed to claim objects for deletion: %w", err)
+			slog.Error("failed to claim objects for deletion", "error", err)
 
 			break
 		}

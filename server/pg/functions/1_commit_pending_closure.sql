@@ -20,10 +20,16 @@ BEGIN
         RAISE EXCEPTION 'Closure does not exist: id=%', closure_id;
     end if;
 
-    -- Commit the pending objects with their references
+    -- Commit every pending object with its references. This includes objects
+    -- that already existed when the closure was created (needs_upload =
+    -- false): upserting them resurrects any tombstone GC placed in the
+    -- meantime, so the committed closure never references a deleted object.
+    -- Rows are locked in key order to keep the lock order consistent with
+    -- other multi-row writers and reduce deadlocks.
     INSERT INTO objects (key, refs, size)
     SELECT key, refs, size FROM pending_objects
     WHERE pending_closure_id = closure_id
+    ORDER BY key
     ON CONFLICT (key)
     DO UPDATE SET
         -- If object exists, merge references (union of arrays, removing duplicates)
@@ -38,7 +44,8 @@ BEGIN
         size = COALESCE(objects.size, EXCLUDED.size),
         -- Resurrect previously tombstoned objects
         deleted_at = NULL,
-        first_deleted_at = NULL;
+        first_deleted_at = NULL,
+        deleting_at = NULL;
 
     -- Delete the pending objects
     DELETE FROM pending_objects WHERE pending_closure_id = closure_id;

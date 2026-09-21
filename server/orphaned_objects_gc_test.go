@@ -36,6 +36,16 @@ func createTestClosure(t *testing.T, service *server.Service, queries *pg.Querie
 	ok(t, err)
 }
 
+// dbNow reads the database clock, which GC uses to stamp deletion claims.
+func dbNow(t *testing.T, queries *pg.Queries) pgtype.Timestamp {
+	t.Helper()
+
+	now, err := queries.Now(t.Context())
+	ok(t, err)
+
+	return now
+}
+
 func createOrphanedObjects(t *testing.T, service *server.Service, objects []struct {
 	key  string
 	refs []string
@@ -218,7 +228,8 @@ func TestOrphanedObjectsGC(t *testing.T) {
 	}
 
 	// Actually delete the objects (simulate full GC)
-	objsToDelete, err := queries.GetObjectsReadyForDeletion(ctx, pg.GetObjectsReadyForDeletionParams{
+	objsToDelete, err := queries.ClaimObjectsForDeletion(ctx, pg.ClaimObjectsForDeletionParams{
+		RunStartedAt:       dbNow(t, queries),
 		GracePeriodSeconds: 0,
 		LimitCount:         1000,
 	})
@@ -437,7 +448,8 @@ func TestOrphanedObjectsGCStressTest(t *testing.T) {
 	ok(t, err)
 
 	// Get objects ready for deletion
-	objsToDelete, err := queries.GetObjectsReadyForDeletion(ctx, pg.GetObjectsReadyForDeletionParams{
+	objsToDelete, err := queries.ClaimObjectsForDeletion(ctx, pg.ClaimObjectsForDeletionParams{
+		RunStartedAt:       dbNow(t, queries),
 		GracePeriodSeconds: 0,
 		LimitCount:         10000,
 	})
@@ -514,7 +526,7 @@ func TestOrphanedObjectsGCStressTest(t *testing.T) {
 
 // TestResurrectedObjectNotDeleted tests the critical bug where objects marked
 // as active after S3 deletion failure would still be selected for deletion
-// on the next GC run because GetObjectsReadyForDeletion only checked
+// on the next GC run because the deletion query only checked
 // first_deleted_at, not deleted_at.
 //
 // Bug scenario:
@@ -599,8 +611,9 @@ func TestResurrectedObjectNotDeleted(t *testing.T) {
 		t.Fatal("Object should still have first_deleted_at set (this is the bug trigger)")
 	}
 
-	// Step 6: Next GC run - GetObjectsReadyForDeletion should NOT return resurrected objects
-	objsToDelete, err := queries.GetObjectsReadyForDeletion(ctx, pg.GetObjectsReadyForDeletionParams{
+	// Step 6: Next GC run - ClaimObjectsForDeletion should NOT return resurrected objects
+	objsToDelete, err := queries.ClaimObjectsForDeletion(ctx, pg.ClaimObjectsForDeletionParams{
+		RunStartedAt:       dbNow(t, queries),
 		GracePeriodSeconds: 0,
 		LimitCount:         1000,
 	})

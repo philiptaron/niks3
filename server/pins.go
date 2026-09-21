@@ -74,9 +74,11 @@ func (s *Service) CreatePinHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Run the existence check and upsert in one transaction with the closure
-	// row locked FOR SHARE, so concurrent GC cannot delete the closure in
-	// between (which would surface as an FK violation / 500).
+	// Run the existence check and upsert in one transaction. The check is an
+	// UPDATE of the closure's updated_at: it takes a row lock that blocks a
+	// concurrent DeleteClosures, and when that resumes it re-evaluates the
+	// row against its cutoff and skips it. A plain FOR SHARE lock would let
+	// the delete proceed afterwards and fail on the pin's foreign key.
 	tx, err := s.Pool.Begin(r.Context())
 	if err != nil {
 		slog.Error("Failed to begin transaction", "error", err)
@@ -91,7 +93,7 @@ func (s *Service) CreatePinHandler(w http.ResponseWriter, r *http.Request) {
 
 	queries := pg.New(tx)
 
-	_, err = queries.GetClosureForShare(r.Context(), narinfoKey)
+	_, err = queries.TouchClosureForPin(r.Context(), narinfoKey)
 	if err != nil {
 		slog.Error("Failed to get closure for pin", "narinfo_key", narinfoKey, "error", err)
 		http.Error(w, "closure not found: store path must be pushed before pinning", http.StatusNotFound)

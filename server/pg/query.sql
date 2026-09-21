@@ -4,7 +4,18 @@ VALUES (timezone('UTC', now()), $1)
 RETURNING *;
 
 -- name: InsertPendingObjects :copyfrom
-INSERT INTO pending_objects (pending_closure_id, key, refs, size) VALUES ($1, $2, $3, $4);
+INSERT INTO pending_objects (pending_closure_id, key, refs, size, needs_upload) VALUES ($1, $2, $3, $4, $5);
+
+-- name: MarkPendingObjectsForUpload :exec
+-- Flip objects the closure originally treated as present to needs_upload,
+-- used when an S3 integrity check finds them missing.
+UPDATE pending_objects SET needs_upload = true
+WHERE pending_closure_id = sqlc.arg(pending_closure_id) AND key = any(sqlc.arg(keys)::varchar []);
+
+-- name: Now :one
+-- The database clock, so timestamps compared against columns stamped with
+-- now() in SQL are not skewed by the application host's clock.
+SELECT timezone('UTC', now())::timestamp AS now;
 
 -- name: GetObjectStats :one
 SELECT object_count, total_bytes FROM object_stats WHERE id;
@@ -16,18 +27,26 @@ SELECT count(*) FROM pending_closures;
 SELECT key FROM pending_objects
 WHERE pending_closure_id = $1;
 
--- name: GetExistingObjects :many
-WITH ct AS (
-    SELECT timezone('UTC', now()) AS now
-)
-
+-- name: LockExistingObjects :many
+-- Share-locks the object rows for the rest of the transaction so the
+-- deletion claim (FOR UPDATE SKIP LOCKED) either sees the pending_objects
+-- rows this transaction inserts or skips the objects for this run. Rows are
+-- locked in key order to keep the lock order consistent across writers.
 SELECT
-    o.key AS key,
-    (CASE
-        WHEN o.first_deleted_at IS NULL THEN NULL
-        ELSE ct.now - o.first_deleted_at
-    END)::interval AS deleted_at
-FROM objects AS o, ct
+    key,
+    (deleted_at IS NOT NULL)::boolean AS tombstoned,
+    deleting_at
+FROM objects
+WHERE key = any($1::varchar [])
+ORDER BY key
+FOR SHARE;
+
+-- name: GetExistingObjects :many
+SELECT
+    key,
+    (deleted_at IS NOT NULL)::boolean AS tombstoned,
+    deleting_at
+FROM objects
 WHERE key = any($1::varchar []);
 
 -- name: GetPresentObjects :many
@@ -35,9 +54,16 @@ WHERE key = any($1::varchar []);
 SELECT key FROM objects
 WHERE key = any($1::varchar []) AND deleted_at IS NULL;
 
--- name: TouchClosures :exec
+-- name: TouchPresentClosures :many
+-- Refresh the closures whose narinfo is live and report which ones were
+-- found. Doing the check and the touch in one statement means a closure
+-- deleted by concurrent GC is never reported as present.
 UPDATE closures SET updated_at = timezone('UTC', now())
-WHERE key = any($1::varchar []);
+FROM objects
+WHERE closures.key = any($1::varchar [])
+  AND objects.key = closures.key
+  AND objects.deleted_at IS NULL
+RETURNING closures.key;
 
 -- name: CommitPendingClosure :exec
 SELECT commit_pending_closure($1::bigint);
@@ -56,7 +82,8 @@ ON CONFLICT (key) DO UPDATE SET
     ),
     size = coalesce(objects.size, excluded.size),
     deleted_at = NULL,
-    first_deleted_at = NULL;
+    first_deleted_at = NULL,
+    deleting_at = NULL;
 
 -- name: GetPendingObject :one
 SELECT refs, size FROM pending_objects
@@ -70,14 +97,13 @@ WHERE key = $1
 LIMIT 1;
 
 -- name: CleanupPendingClosures :execrows
-WITH cutoff_time AS (
-    SELECT timezone('UTC', now()) - interval '1 second' * $1::int AS time
-),
-
-old_closures AS (
+-- The cutoff is passed in so it matches the one used to select the multipart
+-- uploads that were aborted just before; recomputing now() here would let
+-- closures that aged past the cutoff in between be deleted without an abort.
+WITH old_closures AS (
     SELECT id
-    FROM pending_closures, cutoff_time
-    WHERE started_at < cutoff_time.time
+    FROM pending_closures
+    WHERE started_at < sqlc.arg(cutoff)::timestamp
 ),
 
 -- Insert pending objects into objects table if they don't already exist
@@ -87,10 +113,10 @@ inserted_objects AS (
     SELECT
         po.key,
         po.refs,
-        cutoff_time.time,
-        cutoff_time.time
+        sqlc.arg(cutoff)::timestamp,
+        sqlc.arg(cutoff)::timestamp
     FROM pending_objects AS po
-    JOIN old_closures oc ON po.pending_closure_id = oc.id, cutoff_time
+    JOIN old_closures oc ON po.pending_closure_id = oc.id
     ON CONFLICT (key) DO NOTHING
     RETURNING key
 ),
@@ -117,12 +143,12 @@ WHERE key = $1 LIMIT 1;
 -- Return objects reachable from the given closure key
 WITH RECURSIVE closure_reach AS (
     -- Start with the provided closure key
-    SELECT o.key, o.refs 
+    SELECT o.key, o.refs
     FROM objects o
     WHERE o.key = $1
     UNION
     -- Recursively add all referenced objects
-    SELECT o.key, o.refs 
+    SELECT o.key, o.refs
     FROM objects o
     INNER JOIN closure_reach cr ON o.key = ANY(cr.refs)
 )
@@ -135,7 +161,9 @@ WHERE closures.updated_at < $1
   AND closures.key NOT IN (SELECT narinfo_key FROM pins);
 
 -- name: MarkObjectsAsActive :exec
-UPDATE objects SET deleted_at = NULL
+-- Undo a deletion claim whose S3 delete failed. first_deleted_at is kept so
+-- the next mark makes the object eligible again without a new grace period.
+UPDATE objects SET deleted_at = NULL, deleting_at = NULL
 WHERE key = any($1::varchar []);
 
 -- name: DeleteObjects :exec
@@ -150,7 +178,7 @@ VALUES ($1, $2, $3);
 SELECT upload_id, object_key
 FROM multipart_uploads mu
 JOIN pending_closures pc ON mu.pending_closure_id = pc.id
-WHERE pc.started_at < timezone('UTC', now()) - interval '1 second' * $1::int;
+WHERE pc.started_at < sqlc.arg(cutoff)::timestamp;
 
 -- name: DeleteMultipartUpload :exec
 DELETE FROM multipart_uploads
@@ -211,21 +239,36 @@ SET
 FROM stale_objects, ct
 WHERE objects.key = stale_objects.key;
 
--- name: GetObjectsReadyForDeletion :many
--- Returns objects marked for >= grace_period, safe to delete from S3
-SELECT key
-FROM objects
-WHERE first_deleted_at IS NOT NULL
-  AND deleted_at IS NOT NULL
-  AND first_deleted_at <= timezone('UTC', now()) - interval '1 second' * sqlc.arg(grace_period_seconds)::int
-LIMIT sqlc.arg(limit_count);
+-- name: ClaimObjectsForDeletion :many
+-- Claims one batch of tombstoned objects past the grace period for S3
+-- deletion by stamping deleting_at. Claimed rows drop out of the next call,
+-- so a GC run terminates even when some deletions fail; rows still claimed
+-- from a run that died (deleting_at before this run started) are picked up
+-- again. Objects referenced by an in-flight closure are left alone, and rows
+-- share-locked by a closure being created are skipped for this run.
+UPDATE objects SET deleting_at = timezone('UTC', now())
+WHERE key IN (
+    SELECT key
+    FROM objects
+    WHERE deleted_at IS NOT NULL
+      AND (deleting_at IS NULL OR deleting_at < sqlc.arg(run_started_at)::timestamp)
+      AND first_deleted_at <= timezone('UTC', now()) - interval '1 second' * sqlc.arg(grace_period_seconds)::int
+      AND NOT EXISTS (
+          SELECT 1 FROM pending_objects AS po WHERE po.key = objects.key
+      )
+    ORDER BY key
+    LIMIT sqlc.arg(limit_count)
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING key;
 
--- name: GetClosureForShare :one
--- Lock the closure row so concurrent GC cannot delete it between the
--- existence check and the pin upsert.
-SELECT updated_at FROM closures
-WHERE key = $1 LIMIT 1
-FOR SHARE;
+-- name: TouchClosureForPin :one
+-- Refresh and lock the closure row so concurrent GC cannot delete it before
+-- the pin upsert commits: DeleteClosures blocks on the row and then
+-- re-evaluates updated_at against its cutoff, which now fails.
+UPDATE closures SET updated_at = timezone('UTC', now())
+WHERE key = $1
+RETURNING updated_at;
 
 -- name: UpsertPin :exec
 -- Create or update a pin. Updates the narinfo_key, store_path, and updated_at if the pin already exists.

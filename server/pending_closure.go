@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,27 @@ import (
 
 const (
 	maxSignedURLDuration = time.Duration(5) * time.Hour
+
+	// deletionPollInterval is how often a closure waiting on objects that GC
+	// is deleting re-checks them.
+	deletionPollInterval = time.Second
+
+	// deletionWaitTimeout bounds how long closure creation waits for GC to
+	// finish deleting an object it needs. The server's write timeout is 60s,
+	// so waiting longer would only produce a broken response. A batch of S3
+	// deletes normally finishes well within this.
+	deletionWaitTimeout = 30 * time.Second
+
+	// staleClaimAge is how old a deletion claim must be before it is treated
+	// as left behind by a GC run that died. A live run re-stamps claims it
+	// picks up, so a claim this old has no deletion in flight and the object
+	// is simply re-uploaded.
+	staleClaimAge = time.Hour
 )
+
+// errObjectsBeingDeleted is returned when closure creation waited for GC to
+// finish deleting an object and it did not finish in time.
+var errObjectsBeingDeleted = errors.New("objects are being deleted by garbage collection, retry later")
 
 // optionalSize maps a reported size to a nullable column; nil stays NULL and is
 // excluded from byte totals.
@@ -48,11 +69,13 @@ type PendingClosureResponse struct {
 	PendingObjects map[string]PendingObject `json:"pending_objects"`
 }
 
+// PendingClosure is the outcome of recording a closure. Every object of the
+// closure gets a pending_objects row so garbage collection leaves it alone
+// until commit; only the ones in recorded.uploads are handed to the client.
 type PendingClosure struct {
-	id             int64
-	startedAt      time.Time
-	pendingObjects []pg.InsertPendingObjectsParams
-	deletedObjects []string
+	id        int64
+	startedAt time.Time
+	recorded  recordedObjects
 }
 
 func rollbackOnError(ctx context.Context, tx *pgx.Tx, err *error, committed *bool) {
@@ -125,62 +148,92 @@ func (s *Service) checkS3ObjectsExist(ctx context.Context, objectKeys []string) 
 	return missingObjects, nil
 }
 
-func waitForDeletion(ctx context.Context, pool *pgxpool.Pool, inflightPaths []string) (map[string]bool, error) {
-	queries := pg.New(pool)
-
-	missingObjects := make(map[string]bool, len(inflightPaths))
-	for _, objectKey := range inflightPaths {
-		missingObjects[objectKey] = true
+// pendingParams builds the pending_objects row for key.
+func pendingParams(pendingClosureID int64, key string, obj objectWithRefs, needsUpload bool) pg.InsertPendingObjectsParams {
+	refs := obj.Refs
+	if refs == nil {
+		refs = []string{}
 	}
 
-	for len(inflightPaths) > 0 {
-		time.Sleep(time.Duration(1) * time.Second)
-
-		existingObjects, err := queries.GetExistingObjects(ctx, inflightPaths)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get existing objects: %w", err)
-		}
-
-		// reset inflightPaths
-		inflightPaths = inflightPaths[:0]
-
-		for _, existingObject := range existingObjects {
-			deletedAt := existingObject.DeletedAt
-			if !deletedAt.Valid {
-				// Object became active again (resurrected by another pending closure);
-				// do not block the flow.
-				slog.Debug("object became active during wait", "key", existingObject.Key)
-				delete(missingObjects, existingObject.Key)
-
-				continue
-			}
-
-			if deletedAt.Months == 0 && deletedAt.Days == 0 && deletedAt.Microseconds < 1000*1000*30 {
-				inflightPaths = append(inflightPaths, existingObject.Key)
-			} else {
-				delete(missingObjects, existingObject.Key)
-			}
-		}
+	return pg.InsertPendingObjectsParams{
+		PendingClosureID: pendingClosureID,
+		Key:              key,
+		Refs:             refs,
+		Size:             optionalSize(obj.NarSize),
+		NeedsUpload:      needsUpload,
 	}
-
-	return missingObjects, nil
 }
 
-func createPendingClosureInner(
+// objectState classifies an object row for closure creation.
+type objectState int
+
+const (
+	// objectMissing: no row, or a tombstone GC has not claimed yet. Both are
+	// uploaded: a tombstone may come from an abandoned closure that never
+	// uploaded the object, and re-uploading an existing key is idempotent.
+	// The pending_objects row keeps GC from claiming the tombstone.
+	objectMissing objectState = iota
+	// objectPresent: live row, the object is in S3.
+	objectPresent
+	// objectDeleting: GC has claimed the row and may be deleting the S3
+	// object right now. Uploading would race the delete.
+	objectDeleting
+	// objectAbandonedClaim: a claim old enough that its GC run must have
+	// died; there is no deletion in flight, so the object is re-uploaded.
+	objectAbandonedClaim
+)
+
+func classifyObject(row *pg.LockExistingObjectsRow, dbNow time.Time) objectState {
+	switch {
+	case row == nil:
+		return objectMissing
+	case row.DeletingAt.Valid:
+		if dbNow.Sub(row.DeletingAt.Time) > staleClaimAge {
+			return objectAbandonedClaim
+		}
+
+		return objectDeleting
+	case row.Tombstoned:
+		return objectMissing
+	default:
+		return objectPresent
+	}
+}
+
+// recordedObjects is the outcome of recording a set of keys for a closure.
+type recordedObjects struct {
+	// uploads are the pending objects the client must upload.
+	uploads []pg.InsertPendingObjectsParams
+	// present are objects recorded as already in S3 (needs_upload = false).
+	present []string
+	// deleting are objects GC has claimed for deletion. They got no
+	// pending_objects row; the caller retries them once GC is done.
+	deleting []string
+}
+
+func (r *recordedObjects) merge(o recordedObjects) {
+	r.uploads = append(r.uploads, o.uploads...)
+	r.present = append(r.present, o.present...)
+	r.deleting = append(r.deleting, o.deleting...)
+}
+
+// recordPendingObjects inserts pending_objects rows for keys in one
+// transaction, share-locking the object rows first. Keys whose object GC is
+// deleting get no row and are returned as still deleting. The lock makes the
+// deletion claim (FOR UPDATE SKIP LOCKED) either skip these objects for its
+// run or, if it got there first, become visible here as deleting_at.
+func recordPendingObjects(
 	ctx context.Context,
 	pool *pgxpool.Pool,
-	closureKey string,
+	pendingClosureID int64,
 	objectsMap map[string]objectWithRefs,
-	s *Service,
-	verifyS3 bool,
-) (*PendingClosure, error) {
-	if !strings.HasSuffix(closureKey, ".narinfo") {
-		return nil, fmt.Errorf("closure key must end with .narinfo: %s", closureKey)
-	}
+	keys []string,
+) (recordedObjects, error) {
+	var out recordedObjects
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start transaction: %w", err)
+		return out, fmt.Errorf("failed to start transaction: %w", err)
 	}
 
 	committed := false
@@ -189,9 +242,68 @@ func createPendingClosureInner(
 
 	queries := pg.New(tx)
 
-	var pendingClosure pg.PendingClosure
+	var dbNow pgtype.Timestamp
 
-	if pendingClosure, err = queries.InsertPendingClosure(ctx, closureKey); err != nil {
+	if dbNow, err = queries.Now(ctx); err != nil {
+		return out, fmt.Errorf("failed to read database clock: %w", err)
+	}
+
+	var rows []pg.LockExistingObjectsRow
+
+	if rows, err = queries.LockExistingObjects(ctx, keys); err != nil {
+		return out, fmt.Errorf("failed to lock existing objects: %w", err)
+	}
+
+	rowByKey := make(map[string]*pg.LockExistingObjectsRow, len(rows))
+	for i := range rows {
+		rowByKey[rows[i].Key] = &rows[i]
+	}
+
+	params := make([]pg.InsertPendingObjectsParams, 0, len(keys))
+
+	for _, key := range keys {
+		obj := objectsMap[key]
+
+		switch classifyObject(rowByKey[key], dbNow.Time) {
+		case objectMissing, objectAbandonedClaim:
+			p := pendingParams(pendingClosureID, key, obj, true)
+			params = append(params, p)
+			out.uploads = append(out.uploads, p)
+		case objectPresent:
+			params = append(params, pendingParams(pendingClosureID, key, obj, false))
+			out.present = append(out.present, key)
+		case objectDeleting:
+			out.deleting = append(out.deleting, key)
+		}
+	}
+
+	if _, err = queries.InsertPendingObjects(ctx, params); err != nil {
+		return out, fmt.Errorf("failed to insert pending objects: %w", err)
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	committed = true
+
+	return out, nil
+}
+
+func createPendingClosureInner(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	closureKey string,
+	objectsMap map[string]objectWithRefs,
+) (*PendingClosure, error) {
+	if !strings.HasSuffix(closureKey, ".narinfo") {
+		return nil, fmt.Errorf("closure key must end with .narinfo: %s", closureKey)
+	}
+
+	// The pending closure row is committed on its own so a failure while
+	// recording objects leaves something for cleanupPendingClosures to reap.
+	pendingClosure, err := pg.New(pool).InsertPendingClosure(ctx, closureKey)
+	if err != nil {
 		return nil, fmt.Errorf("failed to insert pending closure: %w", err)
 	}
 
@@ -200,74 +312,63 @@ func createPendingClosureInner(
 		keys = append(keys, k)
 	}
 
-	existingObjects, err := queries.GetExistingObjects(ctx, keys)
+	// Sorted so rows are locked in a consistent order across transactions.
+	slices.Sort(keys)
+
+	recorded, err := recordPendingObjects(ctx, pool, pendingClosure.ID, objectsMap, keys)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get existing objects: %w", err)
+		return nil, err
 	}
-
-	deletedObjects := make([]string, 0, len(existingObjects))
-	keysToVerifyInS3 := make([]string, 0, len(existingObjects))
-	// Keep track of "existing" objects before we delete them from the map
-	existingObjectsMap := make(map[string]objectWithRefs)
-
-	for _, existingObject := range existingObjects {
-		if existingObject.DeletedAt.Valid {
-			deletedObjects = append(deletedObjects, existingObject.Key)
-		} else {
-			// Track keys that DB says exist (to verify in S3)
-			keysToVerifyInS3 = append(keysToVerifyInS3, existingObject.Key)
-			// Save the object info before deleting from map
-			existingObjectsMap[existingObject.Key] = objectsMap[existingObject.Key]
-			delete(objectsMap, existingObject.Key)
-		}
-	}
-
-	// Verify that objects the DB says exist actually exist in S3 (if requested)
-	if verifyS3 && len(keysToVerifyInS3) > 0 {
-		missingFromS3, err := s.checkS3ObjectsExist(ctx, keysToVerifyInS3)
-		if err != nil {
-			return nil, fmt.Errorf("failed to verify objects in S3: %w", err)
-		}
-
-		if len(missingFromS3) > 0 {
-			slog.Warn("Found objects in DB but missing from S3, will re-upload",
-				"count", len(missingFromS3))
-			// Add missing objects back to objectsMap so they get uploaded
-			for missingKey := range missingFromS3 {
-				if obj, ok := existingObjectsMap[missingKey]; ok {
-					objectsMap[missingKey] = obj
-				}
-			}
-		}
-	}
-
-	pendingObjects := make([]pg.InsertPendingObjectsParams, 0, len(objectsMap))
-
-	for objectKey, obj := range objectsMap {
-		pendingObjects = append(pendingObjects, pg.InsertPendingObjectsParams{
-			PendingClosureID: pendingClosure.ID,
-			Key:              objectKey,
-			Refs:             obj.Refs,
-			Size:             optionalSize(obj.NarSize),
-		})
-	}
-
-	if _, err = queries.InsertPendingObjects(ctx, pendingObjects); err != nil {
-		return nil, fmt.Errorf("failed to insert pending objects: %w", err)
-	}
-
-	if err = tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	committed = true
 
 	return &PendingClosure{
-		id:             pendingClosure.ID,
-		startedAt:      pendingClosure.StartedAt.Time,
-		pendingObjects: pendingObjects,
-		deletedObjects: deletedObjects,
+		id:        pendingClosure.ID,
+		startedAt: pendingClosure.StartedAt.Time,
+		recorded:  recorded,
 	}, nil
+}
+
+// resolveDeletingObjects waits for garbage collection to finish with objects it
+// has claimed, then records them for the closure. Once the row is gone (or the
+// claim was abandoned) the object is uploaded again; if the claim was undone
+// because the S3 delete failed, the object is present.
+func resolveDeletingObjects(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	pendingClosureID int64,
+	objectsMap map[string]objectWithRefs,
+	deleting []string,
+) (recordedObjects, error) {
+	slog.Info("Waiting for garbage collection to finish deleting objects", "count", len(deleting))
+
+	var out recordedObjects
+
+	deadline := time.Now().Add(deletionWaitTimeout)
+
+	for {
+		round, err := recordPendingObjects(ctx, pool, pendingClosureID, objectsMap, deleting)
+		if err != nil {
+			return recordedObjects{}, err
+		}
+
+		deleting = round.deleting
+		round.deleting = nil
+		out.merge(round)
+
+		if len(deleting) == 0 {
+			return out, nil
+		}
+
+		if time.Now().After(deadline) {
+			return recordedObjects{}, fmt.Errorf("%w: %d objects still claimed after %s",
+				errObjectsBeingDeleted, len(deleting), deletionWaitTimeout)
+		}
+
+		select {
+		case <-ctx.Done():
+			return recordedObjects{}, fmt.Errorf("waiting for object deletion: %w", ctx.Err())
+		case <-time.After(deletionPollInterval):
+		}
+	}
 }
 
 // createPendingObjects generates presigned URLs or multipart upload info for pending objects.
@@ -377,6 +478,48 @@ func (s *Service) makePresignedURL(ctx context.Context, objectKey string, object
 	}, nil
 }
 
+// verifyPresentObjects stats the objects the database says are in S3 and
+// flips the ones that are missing to needs_upload. Runs outside any
+// transaction so S3 round trips hold no row locks.
+func (s *Service) verifyPresentObjects(
+	ctx context.Context,
+	pendingClosureID int64,
+	objectsMap map[string]objectWithRefs,
+	present []string,
+) ([]pg.InsertPendingObjectsParams, error) {
+	missingFromS3, err := s.checkS3ObjectsExist(ctx, present)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify objects in S3: %w", err)
+	}
+
+	if len(missingFromS3) == 0 {
+		return nil, nil
+	}
+
+	slog.Warn("Found objects in DB but missing from S3, will re-upload", "count", len(missingFromS3))
+
+	keys := make([]string, 0, len(missingFromS3))
+	for key := range missingFromS3 {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	if err := pg.New(s.Pool).MarkPendingObjectsForUpload(ctx, pg.MarkPendingObjectsForUploadParams{
+		PendingClosureID: pendingClosureID,
+		Keys:             keys,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to mark pending objects for upload: %w", err)
+	}
+
+	uploads := make([]pg.InsertPendingObjectsParams, 0, len(keys))
+	for _, key := range keys {
+		uploads = append(uploads, pendingParams(pendingClosureID, key, objectsMap[key], true))
+	}
+
+	return uploads, nil
+}
+
 func (s *Service) createPendingClosure(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -384,46 +527,36 @@ func (s *Service) createPendingClosure(
 	objectsMap map[string]objectWithRefs,
 	verifyS3 bool,
 ) (*PendingClosureResponse, error) {
-	pendingClosure, err := createPendingClosureInner(ctx, pool, closureKey, objectsMap, s, verifyS3)
+	pendingClosure, err := createPendingClosureInner(ctx, pool, closureKey, objectsMap)
 	if err != nil {
 		return nil, err
 	}
 
-	pendingObjects := make(map[string]PendingObject, len(pendingClosure.pendingObjects)+len(pendingClosure.deletedObjects))
+	recorded := &pendingClosure.recorded
 
-	if err := s.createPendingObjects(ctx, pendingClosure.id, pendingClosure.pendingObjects, objectsMap, pendingObjects); err != nil {
-		return nil, err
-	}
-
-	if len(pendingClosure.deletedObjects) > 0 {
-		slog.Info("Found objects not yet deleted. Waiting for deletion",
-			"pending_objects", len(pendingClosure.deletedObjects))
-
-		missingObjects, err := waitForDeletion(ctx, pool, pendingClosure.deletedObjects)
+	if len(recorded.deleting) > 0 {
+		resolved, err := resolveDeletingObjects(ctx, pool, pendingClosure.id, objectsMap, recorded.deleting)
 		if err != nil {
 			return nil, err
 		}
 
-		pendingObjectsParams := make([]pg.InsertPendingObjectsParams, 0, len(missingObjects))
-		for objectKey := range missingObjects {
-			obj := objectsMap[objectKey]
-			pendingObjectsParams = append(pendingObjectsParams, pg.InsertPendingObjectsParams{
-				PendingClosureID: pendingClosure.id,
-				Key:              objectKey,
-				Refs:             obj.Refs,
-				Size:             optionalSize(obj.NarSize),
-			})
-		}
+		recorded.deleting = nil
+		recorded.merge(resolved)
+	}
 
-		queries := pg.New(pool)
-
-		if _, err = queries.InsertPendingObjects(ctx, pendingObjectsParams); err != nil {
-			return nil, fmt.Errorf("failed to insert pending objects: %w", err)
-		}
-
-		if err := s.createPendingObjects(ctx, pendingClosure.id, pendingObjectsParams, objectsMap, pendingObjects); err != nil {
+	if verifyS3 && len(recorded.present) > 0 {
+		uploads, err := s.verifyPresentObjects(ctx, pendingClosure.id, objectsMap, recorded.present)
+		if err != nil {
 			return nil, err
 		}
+
+		recorded.uploads = append(recorded.uploads, uploads...)
+	}
+
+	pendingObjects := make(map[string]PendingObject, len(recorded.uploads))
+
+	if err := s.createPendingObjects(ctx, pendingClosure.id, recorded.uploads, objectsMap, pendingObjects); err != nil {
+		return nil, err
 	}
 
 	return &PendingClosureResponse{

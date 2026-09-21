@@ -20,7 +20,10 @@ func (s *Service) PresentHandler(w http.ResponseWriter, r *http.Request) {
 
 	q := pg.New(s.Pool)
 
-	present, err := q.GetPresentObjects(r.Context(), req.Keys)
+	// The touch doubles as the presence check: a closure concurrent GC has
+	// just deleted updates no row and so is not reported as cached, even
+	// though its narinfo object may still be live until the next GC phase.
+	present, err := q.TouchPresentClosures(r.Context(), req.Keys)
 	if err != nil {
 		slog.Error("present", "error", err)
 		http.Error(w, "present: "+err.Error(), http.StatusInternalServerError)
@@ -28,8 +31,8 @@ func (s *Service) PresentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(present) > 0 {
-		_ = q.TouchClosures(r.Context(), present)
+	if present == nil {
+		present = []string{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
