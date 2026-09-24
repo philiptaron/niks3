@@ -1,0 +1,58 @@
+name: CI
+# Mirrors upstream's buildbot-nix run: every checks.x86_64-linux attribute of
+# the flake, one job each so a failure names its check.
+on:
+  push:
+    branches:
+      - fix/gc-transactionality-rebased
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    outputs:
+      checks: ${{ steps.checks.outputs.checks }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Setup Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.thalheim.io
+            extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
+      - name: List checks
+        id: checks
+        run: |
+          echo "checks=$(nix eval .#checks.x86_64-linux --apply builtins.attrNames --json)" >> "$GITHUB_OUTPUT"
+  check:
+    needs: eval
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(needs.eval.outputs.checks) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Setup Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.thalheim.io
+            extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Build ${{ matrix.check }}
+        run: |
+          nix build .#checks.x86_64-linux.${{ matrix.check }} --print-build-logs --no-link
