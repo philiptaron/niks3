@@ -1,0 +1,51 @@
+name: CI darwin
+# Runs the flake's darwin unit-test check on a GitHub macOS runner, with the
+# Nix sandbox on as on upstream's buildbot darwin builders, so failures there
+# can be reproduced and fixed without pushing to the pull request.
+on:
+  push:
+    branches:
+      - ci/darwin
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  go-unit-tests:
+    name: go-unit-tests (${{ matrix.source }}, run ${{ matrix.run }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [branch]
+        run: [1, 2]
+        include:
+          # The pull request before the open-file limit fix, expected to fail
+          # with rustfs out of descriptors at the 256 limit set below.
+          - source: before-fix
+            run: 1
+            ref: ecb3f1e3b476787b76f2084becf42aa6bcaf260d
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.ref || github.sha }}
+      - name: Setup Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            sandbox = true
+            extra-substituters = https://cache.thalheim.io
+            extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
+      - name: Start the tests with macOS's default 256 open-file limit
+        # Set in the check itself, so the run does not depend on the limit
+        # this runner's nix-daemon gives its builds.
+        run: |
+          perl -0pi -e 's/^( *)export HOME=\$TMPDIR\n/$&$1ulimit -Sn 256\n$1echo "open-file limit: \$(ulimit -Sn) soft, \$(ulimit -Hn) hard"\n/m' nix/checks/default.nix
+          if git diff --quiet nix/checks/default.nix; then
+            echo "the ulimit line did not go in" >&2
+            exit 1
+          fi
+          git diff
+      - name: Build checks.aarch64-darwin.go-unit-tests
+        run: nix build .#checks.aarch64-darwin.go-unit-tests --print-build-logs --no-link
