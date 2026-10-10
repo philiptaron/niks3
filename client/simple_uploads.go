@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
+	"io"
 	"net/http"
 	"os"
-
-	"golang.org/x/sys/unix"
 )
 
 // UploadBytesToPresignedURLWithHeaders uploads bytes to a presigned URL with optional custom headers.
@@ -57,59 +55,39 @@ func (c *Client) UploadListingToPresignedURL(ctx context.Context, presignedURL s
 // This follows Nix's convention for compressed build logs stored at log/<drvPath>.
 // The compressedInfo must point to a temporary file created by CompressBuildLog.
 func (c *Client) UploadBuildLogToPresignedURL(ctx context.Context, presignedURL string, compressedInfo *CompressedBuildLogInfo) error {
-	// Open file for mmap
+	stat, err := os.Stat(compressedInfo.TempFile)
+	if err != nil {
+		return fmt.Errorf("stat compressed log: %w", err)
+	}
+
+	fileSize := stat.Size()
+
 	file, err := os.Open(compressedInfo.TempFile)
 	if err != nil {
 		return fmt.Errorf("opening compressed log: %w", err)
 	}
 
-	defer func() {
-		if err := file.Close(); err != nil {
-			slog.Error("Failed to close file", "error", err)
-		}
-	}()
+	// The transport may still read the body after Do returns. A read from a
+	// closed file is an error, a read from an unmapped page is a crash.
+	defer func() { _ = file.Close() }()
 
-	// Get file size
-	stat, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("stat file: %w", err)
+	// Not the *os.File itself: net/http would use sendfile(2), which darwin's
+	// Nix sandbox refuses. ReadAt gives each attempt its own offset.
+	newBody := func() io.ReadCloser {
+		if fileSize == 0 {
+			return http.NoBody
+		}
+
+		return io.NopCloser(io.NewSectionReader(file, 0, fileSize))
 	}
 
-	fileSize := stat.Size()
-
-	var reader *bytes.Reader
-
-	var mmapData []byte // Hold reference for defer
-
-	if fileSize == 0 {
-		// Empty file - can't mmap, just use empty reader
-		reader = bytes.NewReader([]byte{})
-	} else {
-		// Memory-map the file (kernel handles paging, efficient for large files)
-		var err error
-
-		mmapData, err = unix.Mmap(int(file.Fd()), 0, int(fileSize), unix.PROT_READ, unix.MAP_SHARED)
-		if err != nil {
-			return fmt.Errorf("mmap file: %w", err)
-		}
-		// Wrap mmap'd data in bytes.Reader so Go's HTTP client properly sets Content-Length
-		reader = bytes.NewReader(mmapData)
-	}
-
-	// Ensure munmap happens after HTTP request completes
-	defer func() {
-		if mmapData != nil {
-			if err := unix.Munmap(mmapData); err != nil {
-				slog.Error("Failed to unmap file", "error", err)
-			}
-		}
-	}()
-
-	// Create upload request (Go automatically sets ContentLength for bytes.Reader)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, presignedURL, reader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, presignedURL, newBody())
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
+
+	req.ContentLength = fileSize
+	req.GetBody = func() (io.ReadCloser, error) { return newBody(), nil }
 
 	// Set headers
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
