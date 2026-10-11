@@ -35,18 +35,28 @@ func TestRegisterUploadedObject_BoundedAgainstSilentServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c.SetRegistrationTimeout(200 * time.Millisecond)
+	const bound = time.Second
+
+	c.SetRegistrationTimeout(bound)
 
 	pushCtx, cancelPush := context.WithCancel(t.Context())
+	start := time.Now()
 
 	const registrations = 3
 	for range registrations {
 		c.RegisterUploadedObject(pushCtx, "abc.narinfo")
 	}
 
+	for received.Load() < registrations {
+		if time.Since(start) > 10*time.Second {
+			t.Fatalf("server saw %d registrations, want %d", received.Load(), registrations)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
 	cancelPush()
 
-	start := time.Now()
 	done := make(chan struct{})
 
 	go func() {
@@ -57,15 +67,11 @@ func TestRegisterUploadedObject_BoundedAgainstSilentServer(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("WaitRegistrations did not return: registrations against a silent server are unbounded")
 	}
 
-	if n := received.Load(); n != registrations {
-		t.Errorf("server saw %d registrations, want %d", n, registrations)
-	}
-
-	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+	if elapsed := time.Since(start); elapsed < bound {
 		t.Errorf("registrations ended after %v, before their bound: cancelled with the push", elapsed)
 	}
 }
